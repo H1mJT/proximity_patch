@@ -201,6 +201,12 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
 
     // The screen off delay
     private final int mScreenOffDelayConfig;
+    
+    // The Underscreen Proximity sensor
+    private Sensor mFakeProximitySensor;
+
+    // The Orientation Sensor
+    private Sensor mOrientationSensor;
 
     // The doze screen brightness.
     private final float mScreenBrightnessDozeConfig;
@@ -301,6 +307,16 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
 
     // The actual proximity sensor threshold value.
     private float mProximityThreshold;
+    
+    // Art_Chen add for realme X
+    boolean mFakeProximityRegistered;
+
+    boolean mFakeProximityNear;
+
+    boolean mTPProximityNear;
+
+    boolean mOrientationIsFlat;
+    // Art_Chen add end
 
     // Set to true if the proximity sensor listener has been registered
     // with the sensor manager.
@@ -1769,6 +1785,8 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                 ? Sensor.TYPE_PROXIMITY : SensorUtils.NO_FALLBACK;
         mProximitySensor = SensorUtils.findSensor(mSensorManager, proxSensor.type, proxSensor.name,
                 fallbackType);
+        mFakeProximitySensor = mSensorManager.getDefaultSensor(33171005, true);
+        mOrientationSensor = mSensorManager.getDefaultSensor(Sensor.TYPE_TILT_DETECTOR);
         if (mProximitySensor != null) {
             mProximityThreshold = Math.min(mProximitySensor.getMaximumRange(),
                     TYPICAL_PROXIMITY_THRESHOLD);
@@ -1985,6 +2003,8 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                 mIgnoreProximityUntilChanged = false;
                 mSensorManager.registerListener(mProximitySensorListener, mProximitySensor,
                         SensorManager.SENSOR_DELAY_NORMAL, mHandler);
+                mSensorManager.registerListener(mOrientationSensorListener, mOrientationSensor,
+                        SensorManager.SENSOR_DELAY_NORMAL, mHandler);
             }
         } else {
             if (mProximitySensorEnabled) {
@@ -2028,6 +2048,25 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
             debounceProximitySensor();
         }
     }
+    
+    Runnable mUpdateWakelockRunnable = () -> {
+        Slog.i("Art_Chen", "Update WakeLock State, mFakeProximityIsNear is " + mFakeProximityNear);
+        mProximity = mFakeProximityNear ? 1 : 0;
+        updatePowerState();
+        clearPendingProximityDebounceTime();
+        registerFakeSensorListener(false);
+        if (!mFakeProximityNear && !mTPProximityNear) {
+            switchToDefaultProxSensor();
+        }
+    };
+
+    private void switchToDefaultProxSensor() {
+        mSensorManager.unregisterListener(mTPProximitySensorListener);
+        mSensorManager.unregisterListener(mProximitySensorListener);
+        mSensorManager.registerListener(mProximitySensorListener, mProximitySensor,
+            SensorManager.SENSOR_DELAY_NORMAL, mHandler);
+        Slog.i("Art_Chen", "Switch back to Default Proximity Sensor, Reason: mFakeProximityNear && mTPProximityNear is false");
+    }
 
     private void debounceProximitySensor() {
         if (mProximitySensorEnabled
@@ -2041,9 +2080,38 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                     Slog.i(TAG, "No longer ignoring proximity [" + mPendingProximity + "]");
                 }
                 // Sensor reading accepted.  Apply the change then release the wake lock.
-                mProximity = mPendingProximity;
-                updatePowerState();
-                clearPendingProximityDebounceTime(); // release wake lock (must be last)
+		// Art_Chen start for realme X
+                if (mPendingProximity == 1) {
+                   Slog.i("Art_Chen", "Touchpanel Proximity is positive, Now check phone status");
+                   // if (mOrientationIsFlat) {
+                   //    Slog.i("Art_Chen", "Device is Flat, ignore wakelock");
+                   //    mProximity = 0;
+                   //    updatePowerState();
+                   //    clearPendingProximityDebounceTime();
+                   //    return;
+                   // } else {
+                      mSensorManager.unregisterListener(mTPProximitySensorListener);
+                      mSensorManager.unregisterListener(mProximitySensorListener);
+                      registerFakeSensorListener(false);
+                      mSensorManager.registerListener(mProximitySensorListener, mFakeProximitySensor,
+                           50000, mHandler);
+                      mSensorManager.registerListener(mTPProximitySensorListener, mProximitySensor,
+                           SensorManager.SENSOR_DELAY_NORMAL, mHandler);
+                      registerFakeSensorListener(true);
+                      Slog.i("Art_Chen", "Device is Not Flat, registering sensor");
+                      mHandler.postDelayed(mUpdateWakelockRunnable, 150);
+                   // }
+                } else {
+                   mHandler.removeCallbacks(mUpdateWakelockRunnable);
+                   mSensorManager.unregisterListener(mProximitySensorListener);
+                   registerFakeSensorListener(false);
+                   mSensorManager.unregisterListener(mTPProximitySensorListener);
+                   mProximity = mPendingProximity;
+                   updatePowerState();
+                   clearPendingProximityDebounceTime(); // release wake lock (must be last)
+                   mSensorManager.registerListener(mProximitySensorListener, mProximitySensor,
+                       SensorManager.SENSOR_DELAY_NORMAL, mHandler);
+                }
             } else {
                 // Need to wait a little longer.
                 // Debounce again later.  We continue holding a wake lock while waiting.
@@ -2051,6 +2119,19 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
                 mHandler.sendMessageAtTime(msg, mPendingProximityDebounceTime);
             }
         }
+    }
+    
+    private void registerFakeSensorListener(boolean enable) {
+      if (enable && !mFakeProximityRegistered) {
+         mSensorManager.registerListener(mFakeProximitySensorListener, mFakeProximitySensor,
+             SensorManager.SENSOR_DELAY_NORMAL);
+         mFakeProximityRegistered = true;
+         Slog.i("Art_Chen","Fake Prox Sensor registered");
+      } else if (!enable) {
+         mSensorManager.unregisterListener(mFakeProximitySensorListener);
+         mFakeProximityRegistered = false;
+         Slog.i("Art_Chen","Fake Prox Sensor unregistered");
+      }
     }
 
     private void clearPendingProximityDebounceTime() {
@@ -2545,6 +2626,45 @@ final class DisplayPowerController implements AutomaticBrightnessController.Call
     };
 
 
+// Add for realme X
+    private final SensorEventListener mFakeProximitySensorListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+             final float distance = event.values[0];
+             mFakeProximityNear = distance == 0.0f;
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+            // Not used.
+        }
+    };
+
+    private final SensorEventListener mTPProximitySensorListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+             final float distance = event.values[0];
+             mTPProximityNear = distance == 0.0f;
+        }
+        
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+            // Not used.
+        }
+    };
+
+    private final SensorEventListener mOrientationSensorListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+             mOrientationIsFlat = (event.values[0] == 1.0f);
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+            // Not used.
+        }
+    };
+// end
     private final class SettingsObserver extends ContentObserver {
         public SettingsObserver(Handler handler) {
             super(handler);
